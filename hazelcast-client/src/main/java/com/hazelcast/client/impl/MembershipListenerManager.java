@@ -24,6 +24,7 @@ import com.hazelcast.core.MembershipEvent;
 import com.hazelcast.core.MembershipListener;
 
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static com.hazelcast.client.IOUtil.toObject;
@@ -57,11 +58,14 @@ public class MembershipListenerManager {
         return memberShipListeners.isEmpty();
     }
 
+    //todo: Is this being invoked by a single thread, or by multiple threads?
     public void notifyListeners(Packet packet) {
         if (memberShipListeners.size() > 0) {
             Member member = (Member) toObject(packet.getKey());
             Integer type = (Integer) toObject(packet.getValue());
-            MembershipEvent event = new MembershipEvent(client.getCluster(), member, type);
+            //todo: we need to get the members
+            final Set<Member> members = null;
+            MembershipEvent event = new MembershipEvent(client.getCluster(), member, type, members);
             if (type.equals(MembershipEvent.MEMBER_ADDED)) {
                 for (MembershipListener membershipListener : memberShipListeners) {
                     membershipListener.memberAdded(event);

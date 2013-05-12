@@ -17,6 +17,7 @@
 package com.hazelcast.core;
 
 import java.util.EventObject;
+import java.util.Set;
 
 /**
  * Membership event fired when a new member is added
@@ -32,14 +33,32 @@ public class MembershipEvent extends EventObject {
 
     public static final int MEMBER_REMOVED = 3;
 
-    private Member member;
+    private final Set<Member> members;
 
-    private int eventType;
+    private final Member member;
 
-    public MembershipEvent(Cluster cluster, Member member, int eventType) {
+    private final int eventType;
+
+    public MembershipEvent(Cluster cluster, Member member, int eventType, Set<Member> members) {
         super(cluster);
         this.member = member;
         this.eventType = eventType;
+        this.members = members;
+    }
+
+    /**
+     * Returns a consistent view of the the members exactly after this MembershipEvent has been processed. So if a
+     * member is removed, the returned set will not include this member. And if a member is added it will include
+     * this member.
+     *
+     * The problem with calling the {@link com.hazelcast.core.Cluster#getMembers()} is that the content could already
+     * have changed while processing this event so it becomes very difficult to write a deterministic algorithm since
+     * you can't get a deterministic view of the members. This method solves that problem.
+     *
+     * @return the members
+     */
+    public Set<Member> getMembers() {
+        return members;
     }
 
     /**
