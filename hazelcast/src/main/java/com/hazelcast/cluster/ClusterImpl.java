@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicReference;
 public class ClusterImpl implements Cluster {
 
     final CopyOnWriteArraySet<MembershipListener> listeners = new CopyOnWriteArraySet<MembershipListener>();
-    final AtomicReference<Set<MemberImpl>> members = new AtomicReference<Set<MemberImpl>>();
+    final AtomicReference<Set<MemberImpl>> members = new AtomicReference<Set<MemberImpl>>(Collections.EMPTY_SET);
     final AtomicReference<MemberImpl> localMember = new AtomicReference<MemberImpl>();
     final Map<Address, MemberImpl> memberAddressMap = new ConcurrentHashMap<Address, MemberImpl>();
     final Map<MemberImpl, MemberImpl> memberMap = new ConcurrentHashMap<MemberImpl, MemberImpl>();
@@ -50,22 +50,20 @@ public class ClusterImpl implements Cluster {
         setMembers(Arrays.asList(node.getLocalMember()));
     }
 
-    public void setMembers(List<MemberImpl> lsMembers) {
-        final Set<MemberImpl> newMembers = new LinkedHashSet<MemberImpl>(lsMembers.size());
+    public void setMembers(List<MemberImpl> incomingMembers) {
+        final Set<MemberImpl> newMembers = new LinkedHashSet<MemberImpl>(incomingMembers.size());
         final Set<MemberImpl> oldMembers = members.get();
 
         final List<MemberImpl> addedMembers = new LinkedList<MemberImpl>();
         final List<MemberImpl> removedMembers = new LinkedList<MemberImpl>();
 
         //checking for added members
-        for (MemberImpl incomingMember : lsMembers) {
-            //todo: what is the added value of copying to dummy, why is the incomingMember not used directly?
-            MemberImpl dummy = new MemberImpl(incomingMember.getAddress(), incomingMember.localMember(), incomingMember.getNodeType(), incomingMember.getUuid());
-            MemberImpl member = memberMap.get(dummy);
+        for (MemberImpl incomingMember : incomingMembers) {
+            MemberImpl member = memberMap.get(incomingMember);
             if (member == null) {
                 //the member previously didn't exist, so its an added member.
 
-                member = dummy;
+                member = incomingMember;
                 addedMembers.add(member);
                 memberMap.put(member, member);
                 memberAddressMap.put(member.getAddress(), member);
@@ -87,13 +85,8 @@ public class ClusterImpl implements Cluster {
             }
         }
 
-        //we need to have this lock here before the listeners collection is going to be used. If we fail to do so,
-        //it can lead to InitialMembershipListeners that are registered, have not yet received their InitialMembershipEvent
-        //but will normal MembershipEvent. This would break the contract.
-        //In practice it is very unlikely that this lock is going to be contented and the 'setMembers' method is not going
-        //to be called very frequently. So from a performance point of view it isn't a concern. When biased locking is enabled
-        //(default in Oracle JDK 6) the costs will be reduced even more.
-        //check if any members have been added
+        //this lock is needed to correctly deal with the InitialMembershipListener to prevent that is starts
+        //receiving regular MembershopEvents before it has received the InitialMembershipEvent.
         synchronized (memberChangeMutex){
             members.set(Collections.unmodifiableSet(newMembers));
 
@@ -102,7 +95,7 @@ public class ClusterImpl implements Cluster {
                 return;
             }
 
-            LinkedHashSet<Member> membersAfterEvent = new LinkedHashSet<Member>(oldMembers);
+            final LinkedHashSet<Member> membersAfterEvent = new LinkedHashSet<Member>(oldMembers);
             final NamedExecutorService eventExecutor = node.executorManager.getEventExecutorService();
             for (Member addedMember : addedMembers) {
                 membersAfterEvent.add(addedMember);
@@ -140,7 +133,8 @@ public class ClusterImpl implements Cluster {
         }else{
             synchronized (memberChangeMutex) {
                 if(!listeners.add(listener)){
-                    //the listener is already registered, so we are not going to send the initialize event.
+                    //the listener is already registered, so we are done. We don't want to send another
+                    //InitialMembershipEvent.
                     return;
                 }
 
