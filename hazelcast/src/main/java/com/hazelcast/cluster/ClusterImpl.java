@@ -16,23 +16,20 @@
 
 package com.hazelcast.cluster;
 
-import com.hazelcast.core.Cluster;
-import com.hazelcast.core.Member;
-import com.hazelcast.core.MembershipEvent;
-import com.hazelcast.core.MembershipListener;
+import com.hazelcast.core.*;
 import com.hazelcast.util.Clock;
 import com.hazelcast.impl.MemberImpl;
 import com.hazelcast.impl.Node;
 import com.hazelcast.nio.Address;
 
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class ClusterImpl implements Cluster {
 
-    final ConcurrentMap<MembershipListener, MembershipListenerActor> listeners = new ConcurrentHashMap<MembershipListener,MembershipListenerActor>();
+    final CopyOnWriteArraySet<MembershipListener> listeners = new CopyOnWriteArraySet<MembershipListener>();
     final AtomicReference<Set<Member>> members = new AtomicReference<Set<Member>>();
     final AtomicReference<Member> localMember = new AtomicReference<Member>();
     final Map<Member, Member> clusterMembers = new ConcurrentHashMap<Member, Member>();
@@ -40,10 +37,6 @@ public class ClusterImpl implements Cluster {
     @SuppressWarnings("VolatileLongOrDoubleField")
     volatile long clusterTimeDiff = Long.MAX_VALUE;
     final Node node;
-
-    //do we want to have a basic synchronization; which can lead to blocked method calls. Or do we want to have a bit
-    //smarter mechanism where the requests are queued and just processed by a single thread. For the time being this
-    //crude approach should do the trick.
     final Object memberChangeMutex = new Object();
 
     public ClusterImpl(Node node) {
@@ -51,59 +44,54 @@ public class ClusterImpl implements Cluster {
         this.setMembers(Arrays.asList(node.getLocalMember()));
     }
 
-    public  void reset() {
+    public void reset() {
+        mapMembers.clear();
+        clusterMembers.clear();
+
         synchronized (memberChangeMutex){
-            mapMembers.clear();
-            clusterMembers.clear();
+            //todo: do we want a null set or do we want an empty set? Now we are at the risk of exposing null
+            //to the end user.
             members.set(null);
             this.setMembers(Arrays.asList(node.getLocalMember()));
         }
     }
 
-    public  void setMembers(List<MemberImpl> lsMembers) {
+    public void setMembers(List<MemberImpl> lsMembers) {
+        Set<Member> setNew = new LinkedHashSet<Member>(lsMembers.size());
+        Set<Member> membersAfterEvent = new LinkedHashSet<Member>(lsMembers);
+
+        List<Notification> notifications = new LinkedList<Notification>();
+
         synchronized (memberChangeMutex) {
-            Set<Member> setNew = new LinkedHashSet<Member>(lsMembers.size());
-            ArrayList<Runnable> notifications = new ArrayList<Runnable>();
-            final Set<Member> afterEventMembers = Collections.unmodifiableSet(new HashSet(lsMembers));
+
+            //check if any members have been added
             for (MemberImpl member : lsMembers) {
-                if (member != null) {
-                    final MemberImpl dummy = new MemberImpl(member.getAddress(), member.localMember(),
-                            member.getNodeType(), member.getUuid());
-                    Member clusterMember = clusterMembers.get(dummy);
-                    if (clusterMember == null) {
-                        clusterMember = dummy;
-                        if (!listeners.isEmpty()) {
-                            notifications.add(new Runnable() {
-                                public void run() {
-                                    MembershipEvent membershipEvent = new MembershipEvent(ClusterImpl.this,
-                                            dummy, MembershipEvent.MEMBER_ADDED, afterEventMembers);
-                                    for (MembershipListener listener : listeners.values()) {
-                                        listener.memberAdded(membershipEvent);
-                                    }
-                                }
-                            });
-                        }
+                final MemberImpl dummy = new MemberImpl(member.getAddress(), member.localMember(),
+                        member.getNodeType(), member.getUuid());
+                Member clusterMember = clusterMembers.get(dummy);
+                if (clusterMember == null) {
+                    clusterMember = dummy;
+                    MembershipEvent event = new MembershipEvent(this, dummy, MembershipEvent.MEMBER_ADDED, membersAfterEvent);
+                    for (MembershipListener listener : listeners) {
+                        notifications.add(new Notification(event, listener));
                     }
-                    if (clusterMember.localMember()) {
-                        localMember.set(clusterMember);
-                    }
-                    setNew.add(clusterMember);
                 }
+
+                if (clusterMember.localMember()) {
+                    localMember.set(clusterMember);
+                }
+                setNew.add(clusterMember);
             }
-            if (!listeners.isEmpty()) {
-                Set<Member> it = clusterMembers.keySet();
+
+            //check if any members have been removed.
+            if (listeners.size() > 0) {
                 // build a list of notifications but send them AFTER removal
-                for (final Member member : it) {
+                for ( Member member : clusterMembers.keySet()) {
                     if (!setNew.contains(member)) {
-                        notifications.add(new Runnable() {
-                            public void run() {
-                                MembershipEvent membershipEvent = new MembershipEvent(ClusterImpl.this,
-                                        member, MembershipEvent.MEMBER_REMOVED, afterEventMembers);
-                                for (MembershipListener listener : listeners.values()) {
-                                    listener.memberRemoved(membershipEvent);
-                                }
-                            }
-                        });
+                        MembershipEvent event = new MembershipEvent(this, member, MembershipEvent.MEMBER_REMOVED, membersAfterEvent);
+                        for (MembershipListener listener : listeners) {
+                            notifications.add(new Notification(event, listener));
+                        }
                     }
                 }
             }
@@ -113,29 +101,34 @@ public class ClusterImpl implements Cluster {
                 mapMembers.put(((MemberImpl) member).getAddress(), member);
                 clusterMembers.put(member, member);
             }
+
             members.set(Collections.unmodifiableSet(setNew));
+
             // send notifications now
-            for (Runnable notification : notifications) {
-                //there is no need to run this on a different thread since they only thing that is going to be done here
-                //is to place the event on the queue inside of the actor and schedule it for execution. So that should
-                //be very quick.
-                notification.run();
+            for (Notification notification : notifications) {
+                node.executorManager.getEventExecutorService().executeOrderedRunnable(notification.listener.hashCode(), notification);
             }
         }
     }
 
-    public  void addMembershipListener(MembershipListener listener) {
-        synchronized (memberChangeMutex){
-            listeners.put(listener, new MembershipListenerActor(listener));
+    public void addMembershipListener(MembershipListener listener) {
+        if(!(listener instanceof InitialMembershipListener)){
+            listeners.add(listener);
+        }else{
+            synchronized (memberChangeMutex) {
+                if(!listeners.add(listener)){
+                    //the listener is already registered, so we are not going to send the initialize event.
+                    return;
+                }
 
-            //We are now going to send a member added event for each member this cluster currently has to the listener.
-            //This is needed to make sure that a listener will be initialized with a consistent set of members
-            Set<Member> currentMembers = members.get();
-            Set<Member> eventMembers = new HashSet<Member>();
-            for(Member addedMember : members.get()){
-                eventMembers.add(addedMember);
-                MembershipEvent e = new MembershipEvent(this, addedMember, MembershipEvent.MEMBER_ADDED, new HashSet(eventMembers));
-                listener.memberAdded(e);
+                final InitialMembershipListener initializingListener = (InitialMembershipListener) listener;
+                final InitialMembershipEvent event = new InitialMembershipEvent(this, members.get());
+
+                node.executorManager.getEventExecutorService().executeOrderedRunnable(listener.hashCode(), new Runnable(){
+                    public void run() {
+                        initializingListener.init(event);
+                    }
+                });
             }
         }
     }
@@ -186,65 +179,25 @@ public class ClusterImpl implements Cluster {
         return sb.toString();
     }
 
-    private class MembershipListenerActor implements MembershipListener, Runnable{
-        private final BlockingQueue<MembershipEvent> mailbox = new LinkedBlockingQueue<MembershipEvent>();
-        private final MembershipListener target;
-        private final AtomicBoolean scheduled = new AtomicBoolean(false);
+    private static class Notification implements Runnable{
+        private final MembershipListener listener;
+        private final MembershipEvent event;
 
-        private MembershipListenerActor(MembershipListener target) {
-            this.target = target;
-        }
-
-        public void memberAdded(MembershipEvent e) {
-            mailbox.add(e);
-            ensureScheduled();
-        }
-
-        public void memberRemoved(MembershipEvent e) {
-            mailbox.add(e);
-            ensureScheduled();
-        }
-
-        private void ensureScheduled() {
-            if(scheduled.get()){
-                //it is already scheduled, so we are finished.
-                return;
-            }
-
-            if(!scheduled.compareAndSet(false, true)){
-                //somebody else scheduled it, so we are finished.
-                return;
-            }
-
-            //we manage to schedule it, lets hand it over to an executor so it can be processed.
-            node.executorManager.getEventExecutorService().execute(this);
+        private Notification(MembershipEvent event, MembershipListener listener) {
+            this.event = event;
+            this.listener = listener;
         }
 
         public void run() {
-            try {
-                MembershipEvent e = mailbox.poll();
-                switch (e.getEventType()) {
-                    case MembershipEvent.MEMBER_ADDED:
-                        target.memberAdded(e);
-                        break;
-                    case MembershipEvent.MEMBER_REMOVED:
-                        target.memberRemoved(e);
-                        break;
-                    default:
-                        throw new RuntimeException("Unhandeled event: " + e);
-                }
-            } finally {
-                scheduled.set(false);
-                if (!mailbox.isEmpty()) {
-                    //if the mailbox has items, we need to ensure that it scheduled so that no unprocessed messages
-                    //remain in the mailbox.
-
-                    //if performance, so processing a zillion events a second, would be a concern, then you probably want
-                    //to 'batch' the processing of the events; so drain a whole number of events from the mailbox to be processed.
-                    //But members are not being added/removed in that frequency, so it don't need to increase complexity
-                    //to improve performance.
-                    ensureScheduled();
-                }
+            switch (event.getEventType()) {
+                case MembershipEvent.MEMBER_ADDED:
+                    listener.memberAdded(event);
+                    break;
+                case MembershipEvent.MEMBER_REMOVED:
+                    listener.memberRemoved(event);
+                    break;
+                default:
+                    throw new RuntimeException("Unhandeled event: " + event);
             }
         }
     }
