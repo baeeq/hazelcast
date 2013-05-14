@@ -62,6 +62,11 @@ public class ClusterImpl implements Cluster {
 
         List<Notification> notifications = new LinkedList<Notification>();
 
+        //we need to have this lock here before the listeners collection is going to be used. If we fail to do so,
+        //it can lead to InitialMembershipListeners that are registered, have not yet received their InitialMembershipEvent
+        //but will normal MembershipEvent. This would break the contract.
+        //In practice it is very unlikely that this lock is going to be contented and the 'setMembers' method is not going
+        //to be called very frequently. So from a performance point of view it isn't a concern.
         synchronized (memberChangeMutex) {
 
             //check if any members have been added
