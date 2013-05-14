@@ -17,6 +17,7 @@
 package com.hazelcast.cluster;
 
 import com.hazelcast.core.*;
+import com.hazelcast.impl.NamedExecutorService;
 import com.hazelcast.util.Clock;
 import com.hazelcast.impl.MemberImpl;
 import com.hazelcast.impl.Node;
@@ -30,10 +31,11 @@ import java.util.concurrent.atomic.AtomicReference;
 public class ClusterImpl implements Cluster {
 
     final CopyOnWriteArraySet<MembershipListener> listeners = new CopyOnWriteArraySet<MembershipListener>();
-    final AtomicReference<Set<Member>> members = new AtomicReference<Set<Member>>();
-    final AtomicReference<Member> localMember = new AtomicReference<Member>();
-    final Map<Member, Member> clusterMembers = new ConcurrentHashMap<Member, Member>();
-    final Map<Address, Member> mapMembers = new ConcurrentHashMap<Address, Member>();
+    final AtomicReference<Set<MemberImpl>> members = new AtomicReference<Set<MemberImpl>>();
+    final AtomicReference<MemberImpl> localMember = new AtomicReference<MemberImpl>();
+    final Map<Address, MemberImpl> memberAddressMap = new ConcurrentHashMap<Address, MemberImpl>();
+    final Map<MemberImpl, MemberImpl> memberMap = new ConcurrentHashMap<MemberImpl, MemberImpl>();
+
     @SuppressWarnings("VolatileLongOrDoubleField")
     volatile long clusterTimeDiff = Long.MAX_VALUE;
     final Node node;
@@ -41,77 +43,93 @@ public class ClusterImpl implements Cluster {
 
     public ClusterImpl(Node node) {
         this.node = node;
-        this.setMembers(Arrays.asList(node.getLocalMember()));
+        reset();
     }
 
     public void reset() {
-        mapMembers.clear();
-        clusterMembers.clear();
-
-        synchronized (memberChangeMutex){
-            //todo: do we want a null set or do we want an empty set? Now we are at the risk of exposing null
-            //to the end user.
-            members.set(null);
-            this.setMembers(Arrays.asList(node.getLocalMember()));
-        }
+        setMembers(Arrays.asList(node.getLocalMember()));
     }
 
     public void setMembers(List<MemberImpl> lsMembers) {
-        Set<Member> setNew = new LinkedHashSet<Member>(lsMembers.size());
-        Set<Member> membersAfterEvent = new LinkedHashSet<Member>(lsMembers);
+        final Set<MemberImpl> newMembers = new LinkedHashSet<MemberImpl>(lsMembers.size());
+        final Set<MemberImpl> oldMembers = members.get();
 
-        List<Notification> notifications = new LinkedList<Notification>();
+        final List<MemberImpl> addedMembers = new LinkedList<MemberImpl>();
+        final List<MemberImpl> removedMembers = new LinkedList<MemberImpl>();
+
+        //checking for added members
+        for (MemberImpl incomingMember : lsMembers) {
+            //todo: what is the added value of copying to dummy, why is the incomingMember not used directly?
+            MemberImpl dummy = new MemberImpl(incomingMember.getAddress(), incomingMember.localMember(), incomingMember.getNodeType(), incomingMember.getUuid());
+            MemberImpl member = memberMap.get(dummy);
+            if (member == null) {
+                //the member previously didn't exist, so its an added member.
+
+                member = dummy;
+                addedMembers.add(member);
+                memberMap.put(member, member);
+                memberAddressMap.put(member.getAddress(), member);
+            }
+
+            if (member.localMember()) {
+                localMember.set(member);
+            }
+            newMembers.add(member);
+        }
+
+        //checking for removed members
+        for (MemberImpl oldMember : oldMembers) {
+            if (!newMembers.contains(oldMember)) {
+                //so the old member doesn't exist anymore, so it needs to be removed.
+                removedMembers.add(oldMember);
+                memberMap.remove(oldMember);
+                memberAddressMap.remove(oldMember.getAddress());
+            }
+        }
 
         //we need to have this lock here before the listeners collection is going to be used. If we fail to do so,
         //it can lead to InitialMembershipListeners that are registered, have not yet received their InitialMembershipEvent
         //but will normal MembershipEvent. This would break the contract.
         //In practice it is very unlikely that this lock is going to be contented and the 'setMembers' method is not going
-        //to be called very frequently. So from a performance point of view it isn't a concern.
-        synchronized (memberChangeMutex) {
+        //to be called very frequently. So from a performance point of view it isn't a concern. When biased locking is enabled
+        //(default in Oracle JDK 6) the costs will be reduced even more.
+        //check if any members have been added
+        synchronized (memberChangeMutex){
+            members.set(Collections.unmodifiableSet(newMembers));
 
-            //check if any members have been added
-            for (MemberImpl member : lsMembers) {
-                final MemberImpl dummy = new MemberImpl(member.getAddress(), member.localMember(),
-                        member.getNodeType(), member.getUuid());
-                Member clusterMember = clusterMembers.get(dummy);
-                if (clusterMember == null) {
-                    clusterMember = dummy;
-                    MembershipEvent event = new MembershipEvent(this, dummy, MembershipEvent.MEMBER_ADDED, membersAfterEvent);
-                    for (MembershipListener listener : listeners) {
-                        notifications.add(new Notification(event, listener));
-                    }
-                }
-
-                if (clusterMember.localMember()) {
-                    localMember.set(clusterMember);
-                }
-                setNew.add(clusterMember);
+            //if there are no listeners, we are done.
+            if(listeners.isEmpty()){
+                return;
             }
 
-            //check if any members have been removed.
-            if (listeners.size() > 0) {
-                // build a list of notifications but send them AFTER removal
-                for ( Member member : clusterMembers.keySet()) {
-                    if (!setNew.contains(member)) {
-                        MembershipEvent event = new MembershipEvent(this, member, MembershipEvent.MEMBER_REMOVED, membersAfterEvent);
-                        for (MembershipListener listener : listeners) {
-                            notifications.add(new Notification(event, listener));
+            LinkedHashSet<Member> membersAfterEvent = new LinkedHashSet<Member>(oldMembers);
+            final NamedExecutorService eventExecutor = node.executorManager.getEventExecutorService();
+            for (Member addedMember : addedMembers) {
+                membersAfterEvent.add(addedMember);
+
+                final MembershipEvent event = new MembershipEvent(this, addedMember, MembershipEvent.MEMBER_ADDED,
+                        Collections.unmodifiableSet(new LinkedHashSet<Member>(membersAfterEvent)));
+                for (final MembershipListener listener : listeners) {
+                    eventExecutor.executeOrderedRunnable(listener.hashCode(), new Runnable() {
+                        public void run() {
+                            listener.memberAdded(event);
                         }
-                    }
+                    });
                 }
             }
-            clusterMembers.clear();
-            mapMembers.clear();
-            for (Member member : setNew) {
-                mapMembers.put(((MemberImpl) member).getAddress(), member);
-                clusterMembers.put(member, member);
-            }
 
-            members.set(Collections.unmodifiableSet(setNew));
+            for (Member removedMember : removedMembers) {
+                membersAfterEvent.remove(removedMember);
 
-            // send notifications now
-            for (Notification notification : notifications) {
-                node.executorManager.getEventExecutorService().executeOrderedRunnable(notification.listener.hashCode(), notification);
+                final MembershipEvent event = new MembershipEvent(this, removedMember, MembershipEvent.MEMBER_REMOVED,
+                        Collections.unmodifiableSet(new LinkedHashSet<Member>(membersAfterEvent)));
+                for (final MembershipListener listener : listeners) {
+                    eventExecutor.executeOrderedRunnable(listener.hashCode(), new Runnable() {
+                        public void run() {
+                            listener.memberRemoved(event);
+                        }
+                    });
+                }
             }
         }
     }
@@ -127,7 +145,7 @@ public class ClusterImpl implements Cluster {
                 }
 
                 final InitialMembershipListener initializingListener = (InitialMembershipListener) listener;
-                final InitialMembershipEvent event = new InitialMembershipEvent(this, members.get());
+                final InitialMembershipEvent event = new InitialMembershipEvent(this, getMembers());
 
                 node.executorManager.getEventExecutorService().executeOrderedRunnable(listener.hashCode(), new Runnable(){
                     public void run() {
@@ -147,7 +165,8 @@ public class ClusterImpl implements Cluster {
     }
 
     public Set<Member> getMembers() {
-        return members.get();
+        //ieeeuwwwwww
+        return (Set)members.get();
     }
 
     public long getClusterTime() {
@@ -166,7 +185,7 @@ public class ClusterImpl implements Cluster {
     }
 
     public Member getMember(Address address) {
-        return mapMembers.get(address);
+        return memberAddressMap.get(address);
     }
 
     @Override

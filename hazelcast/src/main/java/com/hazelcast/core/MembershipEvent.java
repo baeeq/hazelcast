@@ -55,6 +55,8 @@ public class MembershipEvent extends EventObject {
      * have changed while processing this event so it becomes very difficult to write a deterministic algorithm since
      * you can't get a deterministic view of the members. This method solves that problem.
      *
+     * The set is immutable and ordered. For more information see {@link com.hazelcast.core.Cluster#getMembers()}.
+     *
      * @return the members
      */
     public Set<Member> getMembers() {
