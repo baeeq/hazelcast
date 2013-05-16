@@ -28,6 +28,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static java.util.Collections.unmodifiableSet;
+
 public class ClusterImpl implements Cluster {
 
     final CopyOnWriteArraySet<MembershipListener> listeners = new CopyOnWriteArraySet<MembershipListener>();
@@ -61,7 +63,7 @@ public class ClusterImpl implements Cluster {
         for (MemberImpl incomingMember : incomingMembers) {
             MemberImpl member = memberMap.get(incomingMember);
             if (member == null) {
-                //the member previously didn't exist, so its an added member.
+                //the member previously didn't exist, so its an new member.
 
                 member = incomingMember;
                 addedMembers.add(member);
@@ -88,7 +90,7 @@ public class ClusterImpl implements Cluster {
         //this lock is needed to correctly deal with the InitialMembershipListener to prevent that is starts
         //receiving regular MembershopEvents before it has received the InitialMembershipEvent.
         synchronized (memberChangeMutex){
-            members.set(Collections.unmodifiableSet(newMembers));
+            members.set(unmodifiableSet(newMembers));
 
             //if there are no listeners, we are done.
             if(listeners.isEmpty()){
@@ -101,7 +103,7 @@ public class ClusterImpl implements Cluster {
                 membersAfterEvent.add(addedMember);
 
                 final MembershipEvent event = new MembershipEvent(this, addedMember, MembershipEvent.MEMBER_ADDED,
-                        Collections.unmodifiableSet(new LinkedHashSet<Member>(membersAfterEvent)));
+                        unmodifiableSet(new LinkedHashSet<Member>(membersAfterEvent)));
                 for (final MembershipListener listener : listeners) {
                     eventExecutor.executeOrderedRunnable(listener.hashCode(), new Runnable() {
                         public void run() {
@@ -115,7 +117,7 @@ public class ClusterImpl implements Cluster {
                 membersAfterEvent.remove(removedMember);
 
                 final MembershipEvent event = new MembershipEvent(this, removedMember, MembershipEvent.MEMBER_REMOVED,
-                        Collections.unmodifiableSet(new LinkedHashSet<Member>(membersAfterEvent)));
+                        unmodifiableSet(new LinkedHashSet<Member>(membersAfterEvent)));
                 for (final MembershipListener listener : listeners) {
                     eventExecutor.executeOrderedRunnable(listener.hashCode(), new Runnable() {
                         public void run() {
@@ -133,8 +135,7 @@ public class ClusterImpl implements Cluster {
         }else{
             synchronized (memberChangeMutex) {
                 if(!listeners.add(listener)){
-                    //the listener is already registered, so we are done. We don't want to send another
-                    //InitialMembershipEvent.
+                    //the listener is already registered, so we are done. We don't want to send another InitialMembershipEvent.
                     return;
                 }
 

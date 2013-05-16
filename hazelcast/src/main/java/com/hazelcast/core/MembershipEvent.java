@@ -23,7 +23,11 @@ import java.util.Set;
  * Membership event fired when a new member is added
  * to the cluster and/or when a member leaves the cluster.
  *
+ * If you also need to receive the initial members of the cluster, you can have a look at the {@link InitialMembershipListener}.
+ *
  * @see MembershipListener
+ * @see InitialMembershipEvent
+ * @see InitialMembershipListener
  */
 public class MembershipEvent extends EventObject {
 
@@ -57,7 +61,9 @@ public class MembershipEvent extends EventObject {
      *
      * The set is immutable and ordered. For more information see {@link com.hazelcast.core.Cluster#getMembers()}.
      *
-     * @return the members
+     * On the client null is returned to indicate that this functionality is not implemented.
+     *
+     * @return the members at the moment after this event. Or null if this event is send on the client side.
      */
     public Set<Member> getMembers() {
         return members;
